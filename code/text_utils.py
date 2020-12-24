@@ -4,6 +4,7 @@ import torch
 import numpy as np
 
 from collections import Counter
+from glob import glob
 from nltk.tokenize import sent_tokenize
 from tqdm import tqdm
 
@@ -81,10 +82,11 @@ class Corpus:
 
     def _load(self, lower=True):
         print('Reading raw data')
-        with open(self.DATA_ROOT + self._path) as fp:
-            for s in tqdm(sent_tokenize(fp.read())):
-                if s.strip():
-                    self._sents.append(tokenize(s.strip(), lower=lower))
+        for f in glob(self.DATA_ROOT + self._path):
+            with open(f) as fp:
+                for s in tqdm(sent_tokenize(fp.read())):
+                    if s.strip():
+                        self._sents.append(tokenize(s.strip(), lower=lower))
         print(f'Loaded {len(self._sents)} sentences')
 
         print('Computing token counts')
