@@ -27,13 +27,17 @@ def get_random_contexts(corpus, n, window=5, pad='longest', pytorch=True):
 
         maxlen = max(maxlen, len(context))
 
+    mask = []
     if pad == 'longest':
         contexts = np.array([c + (maxlen - len(c)) * [corpus._pad_tok] for c in contexts])
 
-    centers = np.array([corpus.lookup(x) for x in centers])
-    contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
-    mask = np.ones(contexts.shape, dtype=np.int)
-    mask[contexts == corpus.lookup(corpus._pad_tok)] = 0
+        centers = np.array([corpus.lookup(x) for x in centers])
+        contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
+        mask = np.ones(contexts.shape, dtype=np.int)
+        mask[contexts == corpus.lookup(corpus._pad_tok)] = 0
+    else:
+        centers = np.array([corpus.lookup(x) for x in centers])
+        contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
 
     if pytorch:
         centers = torch.LongTensor(centers)
@@ -63,10 +67,11 @@ class Corpus:
 
     # TODO: Augment this class so that it can take a file pattern and load multiple text files
 
-    def __init__(self, path, min_threshold=-1,
+    def __init__(self, path, min_threshold=-1, max_prob=1e-2,
                  start_token='<s>', end_token='</s>', pad_token='<pad>'):
         self._path = path
         self._min_threshold = min_threshold
+        self._max_prob = max_prob
 
         self._start_tok = start_token
         self._end_tok = end_token
@@ -77,6 +82,8 @@ class Corpus:
 
         self._token2idx = {}
         self._idx2token = {}
+
+        self._idx2prob = []
 
         self._load()
 
@@ -117,6 +124,20 @@ class Corpus:
 
         self._idx2token = {v: k for k, v in self._token2idx.items()}
 
+        base = 0
+        for i in range(self.vocab_size):
+            tok = self._idx2token[i]
+
+            if tok in self._counts:
+                val = self._counts[tok] ** 0.75
+                base += val
+                self._idx2prob.append(val)
+            else:
+                self._idx2prob.append(0)
+
+        self._idx2prob = [(v/base) for v in self._idx2prob]
+        self._idx2prob = [v if v < self._max_prob else 0 for v in self._idx2prob]
+
     def sample_sentences(self, n):
         return np.random.choice(self._sents, size=n, replace=True)
 
@@ -129,4 +150,7 @@ class Corpus:
 
     def rlookup(self, idx):
         return self._idx2token[idx]
+
+    def sample_tokens(self, size):
+        return np.random.choice(list(range(self.vocab_size)), replace=True, size=size)
 

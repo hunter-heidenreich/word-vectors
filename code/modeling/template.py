@@ -13,7 +13,7 @@ class ContextIndependentWordVector(torch.nn.Module):
 
         self._name = name
 
-    def forward(self, input):
+    def forward(self, **kwargs):
         raise NotImplementedError
 
     @property
