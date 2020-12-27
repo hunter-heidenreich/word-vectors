@@ -2,7 +2,7 @@ import torch
 
 from argparse import ArgumentParser
 
-from modeling.word2vec import CBOW, Skipgram, SkipgramNS
+from modeling.word2vec import CBOW, Skipgram, SkipgramNS, CBOWNS
 from text_utils import Corpus, get_random_contexts
 
 
@@ -13,7 +13,7 @@ if __name__ == '__main__':
     corpus = Corpus('*.txt', min_threshold=min_thresh)
 
     vocab_size = corpus.vocab_size
-    hidden_dim = 64
+    hidden_dim = 8
     batch_size = 256
     context_size = 10
     max_steps = 50_000
@@ -23,7 +23,8 @@ if __name__ == '__main__':
     # model = CBOW(vocab_size, hidden_dim)
     # loss_func = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
-    model = SkipgramNS(vocab_size, hidden_dim)
+    # model = SkipgramNS(vocab_size, hidden_dim)
+    model = CBOWNS(vocab_size, hidden_dim)
     loss_func = torch.nn.BCEWithLogitsLoss(reduction='sum')
 
     opt = torch.optim.AdamW(params=list(model.parameters()), lr=learning_rate)

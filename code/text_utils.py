@@ -65,8 +65,6 @@ class Corpus:
 
     DATA_ROOT = 'data/'
 
-    # TODO: Augment this class so that it can take a file pattern and load multiple text files
-
     def __init__(self, path, min_threshold=-1, max_prob=1e-2,
                  start_token='<s>', end_token='</s>', pad_token='<pad>'):
         self._path = path
