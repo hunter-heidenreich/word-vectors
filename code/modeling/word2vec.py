@@ -1,8 +1,47 @@
 import torch
 
 import numpy as np
+import wandb as wb
 
 from .template import ContextIndependentWordVector
+
+
+def get_random_contexts(corpus, n, window=5, pad='longest', pytorch=True):
+    centers = []
+    contexts = []
+    maxlen = -1
+
+    for s in corpus.sample_sentences(n):
+        # select pivot
+        w_id = np.random.randint(low=0, high=len(s))
+        centers.append(s[w_id])
+
+        # construct context
+        context = s[max(0, w_id - window):w_id]
+        if w_id + 1 < len(s):
+            context += s[w_id + 1:min(len(s), w_id + window + 1)]
+        contexts.append(context)
+
+        maxlen = max(maxlen, len(context))
+
+    mask = []
+    if pad == 'longest':
+        contexts = np.array([c + (maxlen - len(c)) * [corpus._pad_tok] for c in contexts])
+
+        centers = np.array([corpus.lookup(x) for x in centers])
+        contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
+        mask = np.ones(contexts.shape, dtype=np.int)
+        mask[contexts == corpus.lookup(corpus._pad_tok)] = 0
+    else:
+        centers = np.array([corpus.lookup(x) for x in centers])
+        contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
+
+    if pytorch:
+        centers = torch.LongTensor(centers)
+        contexts = torch.LongTensor(contexts)
+        mask = torch.LongTensor(mask)
+
+    return centers, contexts, mask
 
 
 def get_negative_samples(corpus, size, k=20):
@@ -45,7 +84,7 @@ class Skipgram(ContextIndependentWordVector):
 
         return word_vectors
 
-    def train_embedding(self, corpus, gen_func, opt, loss_func,
+    def train_embedding(self, corpus, opt, loss_func,
                         iterations=10_000, batch_size=64, window_len=10):
         for step in range(iterations):
             # As discussed in https://arxiv.org/pdf/1402.3722.pdf
@@ -55,7 +94,7 @@ class Skipgram(ContextIndependentWordVector):
             # as the realized context window size
             rand_m = np.random.randint(1, window_len)
 
-            cnt, ctx, _ = gen_func(corpus, batch_size, window=rand_m)
+            cnt, ctx, _ = get_random_contexts(corpus, batch_size, window=rand_m)
 
             pred = self(cnt)
 
@@ -69,6 +108,10 @@ class Skipgram(ContextIndependentWordVector):
             ctx[ctx == corpus.lookup(corpus._pad_tok)] = -100
 
             loss = loss_func(pred, ctx)
+
+            wb.log({
+                'loss': loss.item()
+            })
 
             loss.backward()
             opt.step()
@@ -124,7 +167,7 @@ class CBOW(ContextIndependentWordVector):
 
         return word_vectors
 
-    def train_embedding(self, corpus, gen_func, opt, loss_func,
+    def train_embedding(self, corpus, opt, loss_func,
                         iterations=10_000, batch_size=64, window_len=10):
         for step in range(iterations):
             # As discussed in https://arxiv.org/pdf/1402.3722.pdf
@@ -134,10 +177,14 @@ class CBOW(ContextIndependentWordVector):
             # as the realized context window size
             rand_m = np.random.randint(1, window_len)
 
-            cnt, ctx, msk = gen_func(corpus, batch_size, window=rand_m)
+            cnt, ctx, msk = get_random_contexts(corpus, batch_size, window=rand_m)
             pred = self(ctx, mask=msk)
 
             loss = loss_func(pred, cnt)
+
+            wb.log({
+                'loss': loss.item()
+            })
 
             loss.backward()
             opt.step()
@@ -193,7 +240,7 @@ class SkipgramNS(ContextIndependentWordVector):
 
         return word_vectors
 
-    def train_embedding(self, corpus, gen_func, opt, loss_func,
+    def train_embedding(self, corpus, opt, loss_func,
                         iterations=10_000, batch_size=64, window_len=10,
                         neg_samples=20):
         for step in range(iterations):
@@ -203,15 +250,22 @@ class SkipgramNS(ContextIndependentWordVector):
             # between 1 and m, using that random value
             # as the realized context window size
             rand_m = np.random.randint(1, window_len)
-            cnt, ctx, _ = gen_func(corpus, batch_size, window=rand_m)
+            cnt, ctx, _ = get_random_contexts(corpus, batch_size, window=rand_m)
             neg = get_negative_samples(corpus, ctx.shape, k=neg_samples)
 
             pos_pred, neg_pred = self(cnt, ctx, neg)
             pos_gold = torch.ones(pos_pred.shape)
             neg_gold = torch.zeros(neg_pred.shape)
 
-            loss = loss_func(pos_pred, pos_gold) + loss_func(neg_pred, neg_gold)
-            loss /= batch_size * ctx.size(1)
+            pos_loss = loss_func(pos_pred, pos_gold) / pos_gold.size(0)  # batch_size * ctx.size(1)
+            neg_loss = loss_func(neg_pred, neg_gold) / neg_gold.size(0)  # batch_size * ctx.size(1)
+            loss = pos_loss + neg_loss
+
+            wb.log({
+                'loss': loss.item(),
+                'pos_loss': pos_loss.item(),
+                'neg_loss': neg_loss.item()
+            })
 
             loss.backward()
             opt.step()
@@ -277,7 +331,7 @@ class CBOWNS(ContextIndependentWordVector):
 
         return word_vectors
 
-    def train_embedding(self, corpus, gen_func, opt, loss_func,
+    def train_embedding(self, corpus, opt, loss_func,
                         iterations=10_000, batch_size=64, window_len=10,
                         neg_samples=20):
         for step in range(iterations):
@@ -288,15 +342,22 @@ class CBOWNS(ContextIndependentWordVector):
             # as the realized context window size
             rand_m = np.random.randint(1, window_len)
 
-            cnt, ctx, msk = gen_func(corpus, batch_size, window=rand_m)
+            cnt, ctx, msk = get_random_contexts(corpus, batch_size, window=rand_m)
             neg = get_negative_samples(corpus, ctx.shape, k=neg_samples)
             pos_pred, neg_pred = self(cnt, ctx, neg, mask=msk)
 
             pos_gold = torch.ones(pos_pred.shape)
             neg_gold = torch.zeros(neg_pred.shape)
 
-            loss = loss_func(pos_pred, pos_gold) + loss_func(neg_pred, neg_gold)
-            loss /= batch_size * ctx.size(1)
+            pos_loss = loss_func(pos_pred, pos_gold) / pos_gold.size(0)  # batch_size * ctx.size(1)
+            neg_loss = loss_func(neg_pred, neg_gold) / neg_gold.size(0)  # batch_size * ctx.size(1)
+            loss = pos_loss + neg_loss
+
+            wb.log({
+                'loss':     loss.item(),
+                'pos_loss': pos_loss.item(),
+                'neg_loss': neg_loss.item()
+            })
 
             loss.backward()
             opt.step()
