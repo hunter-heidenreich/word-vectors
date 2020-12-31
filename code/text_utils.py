@@ -60,6 +60,7 @@ class Corpus(Dataset):
         self._corpus = []
         self._counts = {}
         self._word_ctx = defaultdict(list)
+        self._word_co = defaultdict(lambda: defaultdict(int))
 
         self._token2idx = {}
         self._idx2token = {}
@@ -163,6 +164,7 @@ class Corpus(Dataset):
 
     def _slice_corpus(self):
         self._word_ctx = defaultdict(list)
+        self._word_co = defaultdict(list)
         for p in tqdm(self._corpus):
             p_len = len(p)
             for ix, tok in enumerate(p):
@@ -172,6 +174,9 @@ class Corpus(Dataset):
                 # pad context for even-batch processing
                 ctx = [self._pad_tok] * (self._m - len(lctx)) + lctx + rctx + [self._pad_tok] * (self._m - len(rctx))
                 self._word_ctx[tok].append(ctx)
+                self._word_co[tok].extend(lctx + rctx)
+
+        self._word_co = {word: Counter(toks) for word, toks in self._word_co.items()}
 
     def _drop_rare(self):
         if self._dirty:
@@ -225,11 +230,13 @@ class Corpus(Dataset):
             for ctx in ctxs:
                 ictx = torch.LongTensor([self._token2idx[ic] for ic in ctx])
                 weight = torch.Tensor([1 / abs(ix - self._m) for ix in range(self._m)] + [1 / (ix + 1) for ix in range(self._m)])
+                co_occur = torch.Tensor([self._word_co[tok][ic] for ic in ctx])
 
                 self._pairs.append({
                     'word': ix,
                     'context': ictx,
-                    'weight': weight
+                    'weight': weight,
+                    'x_ij': co_occur
                 })
 
     @property
