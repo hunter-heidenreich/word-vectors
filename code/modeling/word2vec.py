@@ -1,56 +1,14 @@
 import torch
 
 import numpy as np
+import torch.nn.functional as F
 import wandb as wb
 
+from tqdm import tqdm
+
+from torch.utils.data import DataLoader
+
 from .template import ContextIndependentWordVector
-
-
-def get_random_contexts(corpus, n, window=5, pad='longest', pytorch=True):
-    centers = []
-    contexts = []
-    maxlen = -1
-
-    for s in corpus.sample_sentences(n):
-        # select pivot
-        w_id = np.random.randint(low=0, high=len(s))
-        centers.append(s[w_id])
-
-        # construct context
-        context = s[max(0, w_id - window):w_id]
-        if w_id + 1 < len(s):
-            context += s[w_id + 1:min(len(s), w_id + window + 1)]
-        contexts.append(context)
-
-        maxlen = max(maxlen, len(context))
-
-    mask = []
-    if pad == 'longest':
-        contexts = np.array([c + (maxlen - len(c)) * [corpus._pad_tok] for c in contexts])
-
-        centers = np.array([corpus.lookup(x) for x in centers])
-        contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
-        mask = np.ones(contexts.shape, dtype=np.int)
-        mask[contexts == corpus.lookup(corpus._pad_tok)] = 0
-    else:
-        centers = np.array([corpus.lookup(x) for x in centers])
-        contexts = np.array([[corpus.lookup(x) for x in xs] for xs in contexts])
-
-    if pytorch:
-        centers = torch.LongTensor(centers)
-        contexts = torch.LongTensor(contexts)
-        mask = torch.LongTensor(mask)
-
-    return centers, contexts, mask
-
-
-def get_negative_samples(corpus, size, k=20):
-    sz = (size[0], size[1], k)
-
-    samples = torch.LongTensor(corpus.sample_tokens(sz))
-    samples = samples.view(sz[0], -1)
-
-    return samples
 
 
 class Skipgram(ContextIndependentWordVector):
@@ -62,63 +20,90 @@ class Skipgram(ContextIndependentWordVector):
 
         self.vectors_in = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim,
                                              padding_idx=vocab_size - 1)
-        self.vectors_out = torch.nn.Linear(hidden_dim, vocab_size)
+        self.vectors_out = torch.nn.Linear(hidden_dim, vocab_size, bias=False)
 
         self._init_weights()
 
     def _init_weights(self):
         initrange = 0.5 / self._hidden_dim
         self.vectors_in.weight.data.uniform_(-initrange, initrange)
-        self.vectors_out.weight.data.uniform_(-0, 0)
 
     def forward(self, centers):
         v_in = self.vectors_in(centers)
         v_out = self.vectors_out(v_in)
         return v_out
 
-    def get_embedding(self):
-        vins = self.vectors_in.weight.data.numpy()
-        vouts = self.vectors_out.weight.data.numpy()
-
-        word_vectors = np.concatenate((vins, vouts), axis=-1)
+    def get_embedding(self, method='word'):
+        if method == 'word':
+            vins = self.vectors_in.weight.data
+            vins = F.normalize(vins, p=2, dim=1)
+            word_vectors = vins.numpy()
+        elif method == 'context':
+            vouts = self.vectors_out.weight.data
+            vouts = F.normalize(vouts, p=2, dim=1)
+            word_vectors = vouts.numpy()
+        elif method == 'add':
+            vins = self.vectors_in.weight.data
+            vouts = self.vectors_out.weight.data
+            vadds = vins + vouts
+            vadds = F.normalize(vadds, p=2, dim=1)
+            word_vectors = vadds.numpy()
+        elif method == 'concat':
+            vins = self.vectors_in.weight.data
+            vouts = self.vectors_out.weight.data
+            vcat = torch.cat((vins, vouts), dim=1)
+            vcat = F.normalize(vcat, p=2, dim=1)
+            word_vectors = vcat.numpy()
+        else:
+            raise ValueError(f'Unrecognized method: {method}')
 
         return word_vectors
 
-    def train_embedding(self, corpus, opt, loss_func,
-                        iterations=10_000, batch_size=64, window_len=10):
-        for step in range(iterations):
-            # As discussed in https://arxiv.org/pdf/1402.3722.pdf
-            # m is a maximal context window,
-            # therefore we'll randomly draw a number
-            # between 1 and m, using that random value
-            # as the realized context window size
-            rand_m = np.random.randint(1, window_len)
+    def train_embedding(self, corpus, opt, loss_func, iterations=10_000, batch_size=64, outpath='', save_every=1):
+        word_mat = self.get_embedding('word')
+        np.save(f'{outpath}word_{0:03d}.npy', word_mat)
 
-            cnt, ctx, _ = get_random_contexts(corpus, batch_size, window=rand_m)
+        cntx_mat = self.get_embedding('context')
+        np.save(f'{outpath}context_{0:03d}.npy', cntx_mat)
 
-            pred = self(cnt)
+        dataloader = DataLoader(corpus, batch_size=batch_size, shuffle=True)
+        for e in range(iterations):
+            print(f'Begining epoch {e+1}')
 
-            # Expand prediction instead of running through multiple times
-            pred = pred.unsqueeze(-1)
-            pred = pred.repeat(1, 1, ctx.size(-1))
-            pred = pred.transpose(1, 2)
-            pred = pred.reshape((pred.size(0) * pred.size(1), pred.size(2)))
+            batch_losses = []
+            for batch in tqdm(dataloader):
+                ws = batch['word'].squeeze()
+                ctxs = batch['context']
 
-            ctx = ctx.flatten()
-            ctx[ctx == corpus.lookup(corpus._pad_tok)] = -100
+                ctx_pred = self(ws)
+                ctx_pred = ctx_pred.unsqueeze(-1)
+                ctx_pred = ctx_pred.repeat(1, 1, ctxs.size(-1))
+                ctx_pred = ctx_pred.transpose(1, 2)
+                ctx_pred = ctx_pred.reshape((ctx_pred.size(0) * ctx_pred.size(1), ctx_pred.size(2)))
 
-            loss = loss_func(pred, ctx)
+                ctx_gold = ctxs.clone()
+                ctx_gold = ctx_gold.flatten()
+                ctx_gold[ctx_gold == corpus.lookup(corpus._pad_tok)] = -100
 
-            wb.log({
-                'loss': loss.item()
-            })
+                loss = loss_func(ctx_pred, ctx_gold)
 
-            loss.backward()
-            opt.step()
-            self.zero_grad()
+                wb.log({
+                    'loss': loss.item()
+                })
+                batch_losses.append(loss.item())
 
-            if step % 10 == 0:
-                print(f'Step {step}: {loss:.4f} loss')
+                loss.backward()
+                opt.step()
+                self.zero_grad()
+
+            print(f'Average batch loss: {np.average(batch_losses)}')
+
+            if (e + 1) % save_every == 0:
+                word_mat = self.get_embedding('word')
+                np.save(f'{outpath}word_{e+1:03d}.npy', word_mat)
+
+                cntx_mat = self.get_embedding('context')
+                np.save(f'{outpath}context_{e+1:03d}.npy', cntx_mat)
 
 
 class CBOW(ContextIndependentWordVector):
@@ -131,26 +116,21 @@ class CBOW(ContextIndependentWordVector):
 
         self.vectors_in = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim,
                                              padding_idx=vocab_size-1)
-        self.vectors_out = torch.nn.Linear(hidden_dim, vocab_size)
+        self.vectors_out = torch.nn.Linear(hidden_dim, vocab_size, bias=False)
 
         self._init_weights()
 
     def _init_weights(self):
         initrange = 0.5 / self._hidden_dim
         self.vectors_in.weight.data.uniform_(-initrange, initrange)
-        self.vectors_out.weight.data.uniform_(-0, 0)
 
-    def forward(self, contexts, mask=None):
+    def forward(self, contexts, weight=None):
         # Index into the input matrix
         v_ins = self.vectors_in(contexts)
 
-        # Average context vectors
-        # (masking allows different sized contexts to be averaged correctly)
-        if mask is not None:
-            v_in = torch.zeros((v_ins.size(0), self._hidden_dim))
-            v_ins_sum = v_ins.sum(dim=1)
-            for dim in range(v_ins_sum.size(0)):
-                v_in[dim] = v_ins_sum[dim] / mask[dim].sum()
+        if weight is not None:
+            weight = weight.unsqueeze(1)
+            v_in = torch.bmm(weight, v_ins).squeeze()
         else:
             v_in = v_ins.mean(dim=1)
 
@@ -159,39 +139,72 @@ class CBOW(ContextIndependentWordVector):
 
         return v_out
 
-    def get_embedding(self):
-        vins = self.vectors_in.weight.data.numpy()
-        vouts = self.vectors_out.weight.data.numpy()
-
-        word_vectors = np.concatenate((vins, vouts), axis=-1)
+    def get_embedding(self, method='word'):
+        if method == 'word':
+            vins = self.vectors_in.weight.data
+            vins = F.normalize(vins, p=2, dim=1)
+            word_vectors = vins.numpy()
+        elif method == 'context':
+            vouts = self.vectors_out.weight.data
+            vouts = F.normalize(vouts, p=2, dim=1)
+            word_vectors = vouts.numpy()
+        elif method == 'add':
+            vins = self.vectors_in.weight.data
+            vouts = self.vectors_out.weight.data
+            vadds = vins + vouts
+            vadds = F.normalize(vadds, p=2, dim=1)
+            word_vectors = vadds.numpy()
+        elif method == 'concat':
+            vins = self.vectors_in.weight.data
+            vouts = self.vectors_out.weight.data
+            vcat = torch.cat((vins, vouts), dim=1)
+            vcat = F.normalize(vcat, p=2, dim=1)
+            word_vectors = vcat.numpy()
+        else:
+            raise ValueError(f'Unrecognized method: {method}')
 
         return word_vectors
 
-    def train_embedding(self, corpus, opt, loss_func,
-                        iterations=10_000, batch_size=64, window_len=10):
-        for step in range(iterations):
-            # As discussed in https://arxiv.org/pdf/1402.3722.pdf
-            # m is a maximal context window,
-            # therefore we'll randomly draw a number
-            # between 1 and m, using that random value
-            # as the realized context window size
-            rand_m = np.random.randint(1, window_len)
+    def train_embedding(self, corpus, opt, loss_func, iterations=10_000, batch_size=64, outpath='', save_every=1):
+        dataloader = DataLoader(corpus, batch_size=batch_size, shuffle=True)
 
-            cnt, ctx, msk = get_random_contexts(corpus, batch_size, window=rand_m)
-            pred = self(ctx, mask=msk)
+        word_mat = self.get_embedding('word')
+        np.save(f'{outpath}word_{0:03d}.npy', word_mat)
 
-            loss = loss_func(pred, cnt)
+        cntx_mat = self.get_embedding('context')
+        np.save(f'{outpath}context_{0:03d}.npy', cntx_mat)
 
-            wb.log({
-                'loss': loss.item()
-            })
+        for e in range(iterations):
+            print(f'Begining epoch {e+1}')
 
-            loss.backward()
-            opt.step()
-            self.zero_grad()
+            batch_losses = []
+            for batch in tqdm(dataloader):
+                ws = batch['word'].squeeze()
+                ctxs = batch['context']
+                weight = batch['weight']
 
-            if step % 10 == 0:
-                print(f'Step {step}: {loss:.4f} loss')
+                ws_pred = self(ctxs, weight=weight)
+                ws_gold = ws.clone()
+
+                loss = loss_func(ws_pred, ws_gold)
+
+                wb.log({
+                    'loss': loss.item()
+                })
+                batch_losses.append(loss.item())
+
+                loss.backward()
+                opt.step()
+                self.zero_grad()
+
+            print(f'Average batch loss: {np.average(batch_losses)}')
+
+            if (e + 1) % save_every == 0:
+                word_mat = self.get_embedding('word')
+                np.save(f'{outpath}word_{e+1:03d}.npy', word_mat)
+
+                cntx_mat = self.get_embedding('context')
+                np.save(f'{outpath}context_{e+1:03d}.npy', cntx_mat)
 
 
 class SkipgramNS(ContextIndependentWordVector):
@@ -202,8 +215,8 @@ class SkipgramNS(ContextIndependentWordVector):
         self._vocab_size = vocab_size
         self._hidden_dim = hidden_dim
 
-        self.V_centers = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim)
-        self.U_contexts = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim)
+        self.V_centers = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim, padding_idx=vocab_size - 1)
+        self.U_contexts = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim, padding_idx=vocab_size - 1)
 
         self._init_weights()
 
@@ -232,47 +245,78 @@ class SkipgramNS(ContextIndependentWordVector):
 
         return pos_scores, neg_scores
 
-    def get_embedding(self):
-        vs = self.V_centers.weight.data.numpy()
-        us = self.U_contexts.weight.data.numpy()
-
-        word_vectors = np.concatenate((vs, us), axis=-1)
+    def get_embedding(self, method='word'):
+        if method == 'word':
+            vins = self.V_centers.weight.data
+            vins = F.normalize(vins, p=2, dim=1)
+            word_vectors = vins.numpy()
+        elif method == 'context':
+            vouts = self.U_contexts.weight.data
+            vouts = F.normalize(vouts, p=2, dim=1)
+            word_vectors = vouts.numpy()
+        elif method == 'add':
+            vins = self.V_centers.weight.data
+            vouts = self.U_contexts.weight.data
+            vadds = vins + vouts
+            vadds = F.normalize(vadds, p=2, dim=1)
+            word_vectors = vadds.numpy()
+        elif method == 'concat':
+            vins = self.V_centers.weight.data
+            vouts = self.U_contexts.weight.data
+            vcat = torch.cat((vins, vouts), dim=1)
+            vcat = F.normalize(vcat, p=2, dim=1)
+            word_vectors = vcat.numpy()
+        else:
+            raise ValueError(f'Unrecognized method: {method}')
 
         return word_vectors
 
-    def train_embedding(self, corpus, opt, loss_func,
-                        iterations=10_000, batch_size=64, window_len=10,
-                        neg_samples=20):
-        for step in range(iterations):
-            # As discussed in https://arxiv.org/pdf/1402.3722.pdf
-            # m is a maximal context window,
-            # therefore we'll randomly draw a number
-            # between 1 and m, using that random value
-            # as the realized context window size
-            rand_m = np.random.randint(1, window_len)
-            cnt, ctx, _ = get_random_contexts(corpus, batch_size, window=rand_m)
-            neg = get_negative_samples(corpus, ctx.shape, k=neg_samples)
+    def train_embedding(self, corpus, opt, loss_func, iterations=10_000, batch_size=64, neg_samples=20,
+                        outpath='', save_every=1):
 
-            pos_pred, neg_pred = self(cnt, ctx, neg)
-            pos_gold = torch.ones(pos_pred.shape)
-            neg_gold = torch.zeros(neg_pred.shape)
+        word_mat = self.get_embedding('word')
+        np.save(f'{outpath}word_{0:03d}.npy', word_mat)
 
-            pos_loss = loss_func(pos_pred, pos_gold) / pos_gold.size(0)  # batch_size * ctx.size(1)
-            neg_loss = loss_func(neg_pred, neg_gold) / neg_gold.size(0)  # batch_size * ctx.size(1)
-            loss = pos_loss + neg_loss
+        cntx_mat = self.get_embedding('context')
+        np.save(f'{outpath}context_{0:03d}.npy', cntx_mat)
 
-            wb.log({
-                'loss': loss.item(),
-                'pos_loss': pos_loss.item(),
-                'neg_loss': neg_loss.item()
-            })
+        dataloader = DataLoader(corpus, batch_size=batch_size, shuffle=True)
+        for e in range(iterations):
+            print(f'Begining epoch {e + 1}')
 
-            loss.backward()
-            opt.step()
-            self.zero_grad()
+            batch_losses = []
+            for batch in tqdm(dataloader):
+                ws = batch['word'].squeeze()
+                ctxs = batch['context']
+                negs = corpus.sample_tokens((ws.size(0), neg_samples))
 
-            if step % 10 == 0:
-                print(f'Step {step}: {loss:.4f} loss')
+                pos_pred, neg_pred = self(ws, ctxs, negs)
+                pos_gold = torch.ones(pos_pred.shape)
+                neg_gold = torch.zeros(neg_pred.shape)
+
+                pos_loss = loss_func(pos_pred, pos_gold) / ws.size(0)
+                neg_loss = loss_func(neg_pred, neg_gold) / ws.size(0)
+                loss = pos_loss + neg_loss
+
+                wb.log({
+                    'loss':     loss.item(),
+                    'pos_loss': pos_loss.item(),
+                    'neg_loss': neg_loss.item()
+                })
+                batch_losses.append(loss.item())
+
+                loss.backward()
+                opt.step()
+                self.zero_grad()
+
+            print(f'Average batch loss: {np.average(batch_losses)}')
+
+            if (e + 1) % save_every == 0:
+                word_mat = self.get_embedding('word')
+                np.save(f'{outpath}word_{e+1:03d}.npy', word_mat)
+
+                cntx_mat = self.get_embedding('context')
+                np.save(f'{outpath}context_{e+1:03d}.npy', cntx_mat)
 
 
 class CBOWNS(ContextIndependentWordVector):
@@ -283,8 +327,10 @@ class CBOWNS(ContextIndependentWordVector):
         self._vocab_size = vocab_size
         self._hidden_dim = hidden_dim
 
-        self.V_centers = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim)
-        self.U_contexts = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim)
+        self.V_centers = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim,
+                                            padding_idx=vocab_size - 1)
+        self.U_contexts = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_dim,
+                                             padding_idx=vocab_size - 1)
 
         self._init_weights()
 
@@ -293,17 +339,14 @@ class CBOWNS(ContextIndependentWordVector):
         self.V_centers.weight.data.uniform_(-initrange, initrange)
         self.U_contexts.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, centers, contexts, neg_centers, mask=None):
+    def forward(self, centers, contexts, neg_centers, weight=None):
         # Index into the input matrix
         context_us = self.U_contexts(contexts)
 
         # Average context vectors
-        # (masking allows different sized contexts to be averaged correctly)
-        if mask is not None:
-            context_hs = torch.zeros((context_us.size(0), self._hidden_dim))
-            context_us_sum = context_us.sum(dim=1)
-            for dim in range(context_us_sum.size(0)):
-                context_hs[dim] = context_us_sum[dim] / mask[dim].sum()
+        if weight is not None:
+            weight = weight.unsqueeze(1)
+            context_hs = torch.bmm(weight, context_us).squeeze()
         else:
             context_hs = context_us.mean(dim=1)  # batch_size X hidden_dim
         context_hs = context_hs.unsqueeze(1)  # batch_size X 1 X hidden_dim
@@ -323,45 +366,76 @@ class CBOWNS(ContextIndependentWordVector):
 
         return pos_scores, neg_scores
 
-    def get_embedding(self):
-        vs = self.V_centers.weight.data.numpy()
-        us = self.U_contexts.weight.data.numpy()
-
-        word_vectors = np.concatenate((vs, us), axis=-1)
+    def get_embedding(self, method='word'):
+        if method == 'word':
+            vins = self.V_centers.weight.data
+            vins = F.normalize(vins, p=2, dim=1)
+            word_vectors = vins.numpy()
+        elif method == 'context':
+            vouts = self.U_contexts.weight.data
+            vouts = F.normalize(vouts, p=2, dim=1)
+            word_vectors = vouts.numpy()
+        elif method == 'add':
+            vins = self.V_centers.weight.data
+            vouts = self.U_contexts.weight.data
+            vadds = vins + vouts
+            vadds = F.normalize(vadds, p=2, dim=1)
+            word_vectors = vadds.numpy()
+        elif method == 'concat':
+            vins = self.V_centers.weight.data
+            vouts = self.U_contexts.weight.data
+            vcat = torch.cat((vins, vouts), dim=1)
+            vcat = F.normalize(vcat, p=2, dim=1)
+            word_vectors = vcat.numpy()
+        else:
+            raise ValueError(f'Unrecognized method: {method}')
 
         return word_vectors
 
-    def train_embedding(self, corpus, opt, loss_func,
-                        iterations=10_000, batch_size=64, window_len=10,
-                        neg_samples=20):
-        for step in range(iterations):
-            # As discussed in https://arxiv.org/pdf/1402.3722.pdf
-            # m is a maximal context window,
-            # therefore we'll randomly draw a number
-            # between 1 and m, using that random value
-            # as the realized context window size
-            rand_m = np.random.randint(1, window_len)
+    def train_embedding(self, corpus, opt, loss_func, iterations=10_000, batch_size=64, neg_samples=20,
+                        outpath='', save_every=1):
+        dataloader = DataLoader(corpus, batch_size=batch_size, shuffle=True)
 
-            cnt, ctx, msk = get_random_contexts(corpus, batch_size, window=rand_m)
-            neg = get_negative_samples(corpus, ctx.shape, k=neg_samples)
-            pos_pred, neg_pred = self(cnt, ctx, neg, mask=msk)
+        word_mat = self.get_embedding('word')
+        np.save(f'{outpath}word_{0:03d}.npy', word_mat)
 
-            pos_gold = torch.ones(pos_pred.shape)
-            neg_gold = torch.zeros(neg_pred.shape)
+        cntx_mat = self.get_embedding('context')
+        np.save(f'{outpath}context_{0:03d}.npy', cntx_mat)
 
-            pos_loss = loss_func(pos_pred, pos_gold) / pos_gold.size(0)  # batch_size * ctx.size(1)
-            neg_loss = loss_func(neg_pred, neg_gold) / neg_gold.size(0)  # batch_size * ctx.size(1)
-            loss = pos_loss + neg_loss
+        for e in range(iterations):
+            print(f'Begining epoch {e + 1}')
 
-            wb.log({
-                'loss':     loss.item(),
-                'pos_loss': pos_loss.item(),
-                'neg_loss': neg_loss.item()
-            })
+            batch_losses = []
+            for batch in tqdm(dataloader):
+                ws = batch['word'].squeeze()
+                ctxs = batch['context']
+                weight = batch['weight']
+                negs = corpus.sample_tokens((ws.size(0), neg_samples))
 
-            loss.backward()
-            opt.step()
-            self.zero_grad()
+                pos_pred, neg_pred = self(ws, ctxs, negs, weight=weight)
+                pos_gold = torch.ones(pos_pred.shape)
+                neg_gold = torch.zeros(neg_pred.shape)
 
-            if step % 10 == 0:
-                print(f'Step {step}: {loss:.4f} loss')
+                pos_loss = loss_func(pos_pred, pos_gold) / ws.size(0)
+                neg_loss = loss_func(neg_pred, neg_gold) / ws.size(0)
+                loss = pos_loss + neg_loss
+
+                wb.log({
+                    'loss':     loss.item(),
+                    'pos_loss': pos_loss.item(),
+                    'neg_loss': neg_loss.item()
+                })
+                batch_losses.append(loss.item())
+
+                loss.backward()
+                opt.step()
+                self.zero_grad()
+
+            print(f'Average batch loss: {np.average(batch_losses)}')
+
+            if (e + 1) % save_every == 0:
+                word_mat = self.get_embedding('word')
+                np.save(f'{outpath}word_{e+1:03d}.npy', word_mat)
+
+                cntx_mat = self.get_embedding('context')
+                np.save(f'{outpath}context_{e+1:03d}.npy', cntx_mat)
